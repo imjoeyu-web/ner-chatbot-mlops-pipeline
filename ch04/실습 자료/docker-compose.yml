@@ -1,0 +1,379 @@
+version: '3.9'
+
+x-airflow-common:
+  &airflow-common
+  # In order to add custom dependencies or upgrade provider packages you can use your extended image.
+  # Comment the image line, place your Dockerfile in the directory where you placed the docker-compose.yaml
+  # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
+  #image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.7.3}
+  build:
+    context: .
+    dockerfile: airflow/Dockerfile
+  environment:
+    &airflow-common-env
+    AIRFLOW__METRICS__STATSD_ON: 'true'
+    AIRFLOW__METRICS__STATSD_HOST: airflow-statsd-exporter
+    AIRFLOW__METRICS__STATSD_PORT: 8125
+    AIRFLOW__METRICS__STATSD_PREFIX: airflow
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://mlops:mlops@postgres/mlops
+    # For backward compatibility, with Airflow <2.3
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://mlops:mlops@postgres/mlops
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://mlops:mlops@postgres/mlops
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    # yamllint disable rule:line-length
+    # Use simple http server on scheduler for health checks
+    # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
+    # yamllint enable rule:line-length
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # WARNING: Use _PIP_ADDITIONAL_REQUIREMENTS option ONLY for a quick checks
+    # for other purpose (development, test and especially production usage) build/extend Airflow image.
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-bentoml<1.3.0 pandas pydantic xgboost tensorflow keras scikit-learn aequitas-lite mlflow}
+    AWS_ACCESS_KEY_ID: mlops
+    AWS_SECRET_ACCESS_KEY: mlopsmlops
+    MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+  volumes:
+    - ./docker-data/airflow/dags:/opt/airflow/dags
+    - ./docker-data/airflow/logs:/opt/airflow/logs
+    - ./docker-data/airflow/config:/opt/airflow/config
+    - ./docker-data/airflow/plugins:/opt/airflow/plugins
+    - /var/run/docker.sock:/var/run/docker.sock
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  gitlab:
+    image: 'gitlab/gitlab-ce:latest'
+    restart: always
+    hostname: gitlab.mlops.io
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://gitlab.mlops.io:8929'
+        gitlab_rails['gitlab_shell_ssh_port'] = 9022
+        postgresql['enable'] = false
+        gitlab_rails['db_adapter'] = 'postgresql'
+        gitlab_rails['db_encoding'] = 'utf8'
+        gitlab_rails['db_host'] = 'postgres'
+        gitlab_rails['db_port'] = 5432
+        gitlab_rails['db_username'] = 'mlops'
+        gitlab_rails['db_password'] = 'mlops'
+        redis['enable'] = false
+        gitlab_rails['redis_host'] = 'redis'
+        gitlab_rails['redis_port'] = 6379
+        gitlab_rails['auto_migrate'] = false
+        gitlab_rails['monitoring_whitelist'] = ['127.0.0.1']
+    ports:
+      - '8929:8929'
+      - '9022:22'
+    healthcheck:
+      test: [ "CMD", "curl", "--fail", "http://localhost:8929/-/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 2m
+    volumes:
+      - './docker-data/gitlab/config:/etc/gitlab'
+      - './docker-data/gitlab/logs:/var/log/gitlab'
+      - './docker-data/gitlab/data:/var/opt/gitlab'
+    shm_size: '256m'
+    depends_on:
+      - postgres
+      - redis
+
+  gitlab-runner:
+   image: gitlab/gitlab-runner:latest
+   restart: always
+   volumes:
+     - './docker-data/gitlab-runner/config:/etc/gitlab-runner'
+     - '/var/run/docker.sock:/var/run/docker.sock'
+   depends_on:
+     - gitlab
+
+  postgres:
+    image: postgres:13
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_USER: 'mlops'
+      POSTGRES_PASSWORD: 'mlops'
+      POSTGRES_DB: 'mlops'
+    volumes:
+      - ./docker-data/postgres/data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "mlops" ]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  redis:
+    image: redis:latest
+    ports:
+      - 6379:6379
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: [ "CMD", "curl", "--fail", "http://localhost:8080/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: [ "CMD", "curl", "--fail", "http://localhost:8974/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    ports:
+      - "8022:22"
+    healthcheck:
+      # yamllint disable rule:line-length
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      # Required to handle warm shutdown of the celery workers properly
+      # See https://airflow.apache.org/docs/docker-stack/entrypoint.html#signal-propagation
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: [ "CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"' ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    # yamllint disable rule:line-length
+    command:
+      - -c
+      - |
+        export PATH=/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin:$$PATH
+        function ver() {
+          printf "%04d%04d%04d%04d" $${1//./ }
+        }
+        airflow_version=$$(airflow version 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+')
+        airflow_version_comparable=$$(ver $${airflow_version})
+        min_airflow_version=2.2.0
+        min_airflow_version_comparable=$$(ver $${min_airflow_version})
+        if (( airflow_version_comparable < min_airflow_version_comparable )); then
+          echo
+          echo -e "\033[1;31mERROR!!!: Too old Airflow version $${airflow_version}!\e[0m"
+          echo "The minimum Airflow version supported: $${min_airflow_version}. Only use this or higher!"
+          echo
+          exit 1
+        fi
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+          echo "If you are on Linux, you SHOULD follow the instructions below to set "
+          echo "AIRFLOW_UID environment variable, otherwise files will be owned by root."
+          echo "For other operating systems you can get rid of the warning with manually created .env file:"
+          echo "    See: https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#setting-the-right-airflow-user"
+          echo
+        fi
+        one_meg=1048576
+        mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+        cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+        disk_available=$$(df / | tail -1 | awk '{print $$4}')
+        warning_resources="false"
+        if (( mem_available < 4000 )) ; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough memory available for Docker.\e[0m"
+          echo "At least 4GB of memory required. You have $$(numfmt --to iec $$((mem_available * one_meg)))"
+          echo
+          warning_resources="true"
+        fi
+        if (( cpus_available < 2 )); then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough CPUS available for Docker.\e[0m"
+          echo "At least 2 CPUs recommended. You have $${cpus_available}"
+          echo
+          warning_resources="true"
+        fi
+        if (( disk_available < one_meg * 10 )); then
+          echo
+          echo -e "\033[1;33mWARNING!!!: Not enough Disk space available for Docker.\e[0m"
+          echo "At least 10 GBs recommended. You have $$(numfmt --to iec $$((disk_available * 1024 )))"
+          echo
+          warning_resources="true"
+        fi
+        if [[ $${warning_resources} == "true" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: You have not enough resources to run Airflow (see above)!\e[0m"
+          echo "Please follow the instructions to increase amount of resources available:"
+          echo "   https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#before-you-begin"
+          echo
+        fi
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
+        exec /entrypoint airflow version
+    # yamllint enable rule:line-length
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-mlops}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-mlops}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+    volumes:
+      - ./docker-data/airflow:/sources
+
+  docker-registry:
+   restart: always
+   image: registry:2
+   volumes:
+     - ./docker-data/docker-registry:/var/lib/registry
+   ports:
+     - "6000:5000"
+
+  airflow-statsd-exporter:
+    image: prom/statsd-exporter
+    command: "--statsd.listen-udp=:8125 --web.listen-address=:9102 --statsd.mapping-config=/config/statsd.conf"
+    ports:
+      - 9102:9102
+      - 8125:8125/udp
+    volumes:
+      - './docker-data/airflow-statsd-exporter/config:/config'
+
+  prometheus:
+    image: 'prom/prometheus:latest'
+    restart: always
+    command:
+      - '--web.enable-lifecycle'
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 5s
+    ports:
+      - '9090:9090'
+    volumes:
+      - './docker-data/prometheus/config:/etc/prometheus'
+      - './docker-data/prometheus/data:/prometheus'
+
+  grafana:
+    image: grafana/grafana
+    healthcheck:
+      test: [ "CMD", "curl", "--fail", "http://localhost:3000/api/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    ports:
+      - 3000:3000
+    volumes:
+      - './docker-data/grafana/data:/var/lib/grafana'
+    restart: always
+
+  minio:
+    restart: always
+    image: minio/minio
+    ports:
+      - 9000:9000
+      - 9001:9001
+    environment:
+      MINIO_ROOT_USER: mlops
+      MINIO_ROOT_PASSWORD: mlopsmlops
+    command: server /data --console-address ':9001'
+    healthcheck:
+      test: timeout 5s bash -c ':> /dev/tcp/127.0.0.1/9000' || exit 1
+      interval: 5s
+      retries: 1
+      start_period: 5s
+      timeout: 5s
+    volumes:
+      - ./docker-data/minio/data:/data
+
+  mlflow-server:
+    restart: always
+    build:
+      context: .
+      dockerfile: mlflow/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - 5001:5000
+    environment:
+      AWS_ACCESS_KEY_ID: mlops
+      AWS_SECRET_ACCESS_KEY: mlopsmlops
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mc config host add mlflowminio http://minio:9000 mlops mlopsmlops &&
+        mc mb --ignore-existing mlflowminio/mlflow
+        mlflow server \
+        --backend-store-uri postgresql://mlops:mlops@postgres/mlflow \
+        --default-artifact-root s3://mlflow/ \
+        --host 0.0.0.0
+
+#  model-serving:
+#    image: localhost:6000/model_serving:latest
+#    ports:
+#      - "3333:3000"

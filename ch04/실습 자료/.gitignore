@@ -1,0 +1,5 @@
+/.idea
+/docker-data
+/source/sample_data/
+.env
+*.zip

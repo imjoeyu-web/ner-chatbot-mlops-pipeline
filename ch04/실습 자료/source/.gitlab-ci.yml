@@ -1,0 +1,57 @@
+stages:
+  - test
+  - deploy
+
+build-job:
+  image:
+    name: localhost:6000/airflow_with_docker:latest
+    entrypoint: [ "" ]
+  stage: test
+  before_script:
+    - cp -r ${CI_PROJECT_DIR}/* /opt/airflow/dags
+    - pip install -r requirements.txt
+    - airflow db init
+    - airflow standalone &> airflow.log 2>&1 &
+    - airflow dags report -v > report.log
+    - airflow variables set isProd false
+  script:
+    - airflow dags backfill deploy_model --start-date ${CI_PIPELINE_CREATED_AT:0:10} --end-date ${CI_PIPELINE_CREATED_AT:0:10} -t containerize
+    - tail report.log
+    - |
+      if grep -Fwq "ERROR" report.log
+      then
+        echo "Error!"
+        exit 1
+      fi
+
+deploy-job:
+  image: ubuntu:20.04
+  stage: deploy
+  only:
+    - main
+  environment: production
+  before_script:
+    - 'command -v ssh-agent >/dev/null || ( apt-get update -y && apt-get install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - chmod 400 "$SSH_PRIVATE_KEY"
+    - ssh-add "$SSH_PRIVATE_KEY"
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - cd ${CI_BUILDS_DIR}
+    - mkdir -p deploy_${CI_COMMIT_SHORT_SHA}
+    - cp -r ${CI_PROJECT_DIR}/* ${CI_BUILDS_DIR}/deploy_${CI_COMMIT_SHORT_SHA}
+    - tar cvfz model-${CI_COMMIT_SHORT_SHA}.gz deploy_${CI_COMMIT_SHORT_SHA}
+    - echo ${KNOWN_HOST} > ~/.ssh/known_hosts
+    - ssh -p 8022 airflow@airflow-worker.mlops.io "cd ~ && mkdir -p upload"
+    - scp -P 8022 model-${CI_COMMIT_SHORT_SHA}.gz airflow@airflow-worker.mlops.io:~/upload
+    - ssh -p 8022 airflow@airflow-worker.mlops.io "cd upload && tar xvfz model-${CI_COMMIT_SHORT_SHA}.gz && cd deploy_${CI_COMMIT_SHORT_SHA} && cp -r * /opt/airflow/dags" 
+      
+  artifacts:
+    name: "${CI_COMMA_SHA}"
+    expire_in: 1 days
+    paths:
+      - ${CI_PROJECT_DIR}
+    exclude:
+    - sample_data/**/*
+    - .git/**/*
